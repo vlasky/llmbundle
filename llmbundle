@@ -1,0 +1,199 @@
+#!/bin/bash
+
+# Function to print help message
+print_help() {
+    echo "Usage: llmbundle [-o output_file] [file1] [file2] ... [fileN]"
+    echo ""
+    echo "llmbundle bundles files and directories into a self-contained bash script."
+    echo "When the script is executed, it will extract its contents."
+    echo "Useful for sharing a set of files with LLMs for content modification and analysis."
+    echo ""
+    echo "Options:"
+    echo "  -o output_file    Write output to file instead of stdout"
+    echo ""
+    echo "Arguments:"
+    echo "  file1, file2, ..., fileN    Files or directories to bundle in the script"
+    echo ""
+    echo "Examples:"
+    echo "  llmbundle file1.txt folder1/* folder2/*.txt"
+    echo "  llmbundle -o bundle.sh file1.txt folder1/*"
+}
+
+# Function to escape special characters in the content
+escape_content() {
+    sed 's/EOF/EOF\\EOF/g' | sed 's/\\/\\\\/g'
+}
+
+# Function to detect if a file is binary
+is_binary() {
+    local file="$1"
+    if file "$file" | grep -q "text"; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+# Function to create a here-document for a file
+create_here_document() {
+    local file="$1"
+    local content
+
+    if is_binary "$file"; then
+        echo "base64 -d << 'EOF' > \"$file\""
+        base64 "$file"
+        echo "EOF"
+    else
+        echo "cat << 'EOF' > \"$file\""
+        content=$(cat "$file" | escape_content)
+        echo "$content"
+        echo "EOF"
+    fi
+    echo
+    echo "chmod $(stat -c %a "$file") \"$file\""
+    echo
+}
+
+# Function to process directories
+process_directory() {
+    local dir="$1"
+    local current_dir=""
+
+    # Skip if it's the current directory
+    if [ "$dir" = "." ] || [ "$dir" = "./" ]; then
+        return
+    fi
+
+    # Split the path and create each level separately
+    IFS='/' read -ra DIR_LEVELS <<< "$dir"
+    for level in "${DIR_LEVELS[@]}"; do
+        if [ -n "$level" ]; then
+            if [ -z "$current_dir" ]; then
+                current_dir="$level"
+            else
+                current_dir="$current_dir/$level"
+            fi
+            echo "# DIRECTORY: $current_dir"
+            echo "mkdir -p \"$current_dir\""
+            echo "chmod $(stat -c %a "$current_dir") \"$current_dir\""
+            echo
+        fi
+    done
+}
+
+# Parse command line options
+output_file=""
+while getopts ":o:h" opt; do
+    case $opt in
+        o)
+            output_file="$OPTARG"
+            ;;
+        h)
+            print_help
+            exit 0
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            print_help
+            exit 1
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            print_help
+            exit 1
+            ;;
+    esac
+done
+
+# Shift past the last option
+shift $((OPTIND-1))
+
+# Check if no files were provided
+if [ $# -eq 0 ]; then
+    print_help
+    exit 1
+fi
+
+# Function to generate the script content
+generate_script() {
+    cat << 'EOF'
+#!/bin/bash
+
+# INSTRUCTIONS FOR LLM:
+# This script contains the contents of multiple files, encoded as here-documents.
+# Each file is represented in the following format:
+#
+# # FILE: <filename>
+# cat << EOF > "<filename>"
+# <file contents>
+# EOF
+# chmod <permissions> "<filename>"
+#
+# For binary files, the format is slightly different:
+#
+# # FILE: <filename> (BINARY)
+# base64 -d << EOF > "<filename>"
+# <base64 encoded file contents>
+# EOF
+# chmod <permissions> "<filename>"
+#
+# Directories are represented as:
+# # DIRECTORY: <directory_path>
+# mkdir -p "<directory_path>"
+# chmod <permissions> "<directory_path>"
+#
+# Each level of the directory structure is created separately
+# to preserve the correct permissions for each level.
+#
+# To modify the contents of a file:
+# 1. Locate the section for the file you want to modify
+# 2. Edit the contents between the EOF delimiters
+# 3. Do not modify the lines containing "cat << EOF", "EOF", or the chmod command
+# 4. For binary files, ensure you maintain valid base64 encoding if you modify the contents
+#
+# Do not modify anything outside of the file content sections unless explicitly instructed to do so.
+
+EOF
+
+    for arg in "$@"; do
+        if [ -d "$arg" ]; then
+            # If it's a directory, process it
+            process_directory "$arg"
+        elif [ -f "$arg" ]; then
+            # If it's a file, create its parent directory and then the file
+            dir=$(dirname "$arg")
+            process_directory "$dir"
+            if is_binary "$arg"; then
+                echo "# FILE: $arg (BINARY)"
+            else
+                echo "# FILE: $arg"
+            fi
+            create_here_document "$arg"
+        else
+            # If it's a pattern, expand it and process each match
+            for file in $arg; do
+                if [ -d "$file" ]; then
+                    process_directory "$file"
+                elif [ -f "$file" ]; then
+                    dir=$(dirname "$file")
+                    process_directory "$dir"
+                    if is_binary "$file"; then
+                        echo "# FILE: $file (BINARY)"
+                    else
+                        echo "# FILE: $file"
+                    fi
+                    create_here_document "$file"
+                fi
+            done
+        fi
+    done
+}
+
+# Generate and output the script
+if [ -n "$output_file" ]; then
+    generate_script "$@" > "$output_file"
+    chmod +x "$output_file"
+    echo "Script generated in: $output_file"
+else
+    generate_script "$@"
+fi
